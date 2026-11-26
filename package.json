@@ -1,0 +1,23 @@
+{
+  "name": "mw-rid",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "workspaces": [
+    "packages/rid-sdk",
+    "apps/id"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace=@moonwitness/rid-sdk && npm run build --workspace=@moonwitness/rid-server",
+    "typecheck": "npm run build",
+    "test": "npm run build && node --test tests/rid.test.mjs",
+    "start": "node apps/id/dist/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.3"
+  }
+}
