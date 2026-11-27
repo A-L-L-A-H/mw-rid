@@ -9,7 +9,19 @@ export type OutboxEventType =
   | 'account.disabled'
   | 'grant.revoked'
   | 'api_key.created'
-  | 'api_key.revoked';
+  | 'api_key.revoked'
+  | 'jti.revoked'
+  | 'jwks.rotated';
+
+export interface RevokedJtiRecord {
+  seq: number;
+  jti: string;
+  kid: string | null;
+  sub: string | null;
+  reason: string | null;
+  expires_at: number | null;
+  revoked_at: string;
+}
 
 export interface FederatedIdentityRecord {
   provider: string;
@@ -157,6 +169,18 @@ export class IdentityDatabase {
         revoked_at TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_tenant_api_keys_tenant ON tenant_api_keys(tenant_id);
+
+      CREATE TABLE IF NOT EXISTS revoked_jtis (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        jti TEXT NOT NULL UNIQUE,
+        kid TEXT,
+        sub TEXT,
+        reason TEXT,
+        expires_at INTEGER,
+        revoked_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_revoked_jtis_revoked_at ON revoked_jtis(revoked_at);
+      CREATE INDEX IF NOT EXISTS idx_revoked_jtis_expires_at ON revoked_jtis(expires_at);
     `);
   }
 
@@ -644,6 +668,142 @@ export class IdentityDatabase {
       .prepare('UPDATE identity_outbox SET acked_at = ? WHERE id = ? AND acked_at IS NULL')
       .run(now, eventId);
     return Number(result.changes) > 0;
+  }
+
+  public revokeJti(input: {
+    jti: string;
+    kid?: string | null;
+    sub?: string | null;
+    reason?: string | null;
+    expiresAt?: number | null;
+    revokedAt?: string;
+  }): { record: RevokedJtiRecord; created: boolean } {
+    const jti = input.jti.trim();
+    if (!jti) {
+      throw new Error('jti is required.');
+    }
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const existing = this.db
+        .prepare('SELECT * FROM revoked_jtis WHERE jti = ? LIMIT 1')
+        .get(jti) as RevokedJtiRecord | undefined;
+
+      if (existing) {
+        this.db.exec('COMMIT');
+        return { record: existing, created: false };
+      }
+
+      const now = input.revokedAt ?? new Date().toISOString();
+      const kid = input.kid ?? null;
+      const sub = input.sub ?? null;
+      const reason = input.reason ?? null;
+      const expiresAt =
+        typeof input.expiresAt === 'number' && Number.isFinite(input.expiresAt)
+          ? Math.floor(input.expiresAt)
+          : null;
+
+      const insertResult = this.db
+        .prepare(
+          `INSERT INTO revoked_jtis (jti, kid, sub, reason, expires_at, revoked_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(jti, kid, sub, reason, expiresAt, now);
+
+      const seq = Number(insertResult.lastInsertRowid);
+
+      this.insertOutboxEvent('jti.revoked', jti, {
+        seq,
+        jti,
+        kid,
+        sub,
+        reason,
+        expires_at: expiresAt,
+        revoked_at: now,
+      });
+
+      this.db.exec('COMMIT');
+
+      return {
+        created: true,
+        record: {
+          seq,
+          jti,
+          kid,
+          sub,
+          reason,
+          expires_at: expiresAt,
+          revoked_at: now,
+        },
+      };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  public findRevokedJti(jti: string): RevokedJtiRecord | undefined {
+    const trimmed = jti.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    return this.db
+      .prepare('SELECT * FROM revoked_jtis WHERE jti = ? LIMIT 1')
+      .get(trimmed) as RevokedJtiRecord | undefined;
+  }
+
+  public isJtiRevoked(jti: string): boolean {
+    const trimmed = jti.trim();
+    if (!trimmed) {
+      return false;
+    }
+    const row = this.db
+      .prepare('SELECT 1 AS found FROM revoked_jtis WHERE jti = ? LIMIT 1')
+      .get(trimmed) as { found: number } | undefined;
+    return row !== undefined;
+  }
+
+  public listRevokedJtis(options: {
+    sinceSeq?: number;
+    sinceRevokedAt?: string;
+    limit?: number;
+    includeExpired?: boolean;
+    nowEpochSeconds?: number;
+  } = {}): RevokedJtiRecord[] {
+    const clauses: string[] = [];
+    const params: Array<number | string> = [];
+
+    if (options.sinceSeq !== undefined && Number.isFinite(options.sinceSeq)) {
+      clauses.push('seq > ?');
+      params.push(Math.max(0, Math.floor(options.sinceSeq)));
+    }
+
+    if (options.sinceRevokedAt && options.sinceRevokedAt.trim().length > 0) {
+      clauses.push('revoked_at > ?');
+      params.push(options.sinceRevokedAt.trim());
+    }
+
+    if (!options.includeExpired) {
+      const nowEpoch = options.nowEpochSeconds ?? Math.floor(Date.now() / 1000);
+      clauses.push('(expires_at IS NULL OR expires_at >= ?)');
+      params.push(nowEpoch);
+    }
+
+    const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rawLimit = options.limit ?? 500;
+    const boundedLimit = Math.min(1000, Math.max(1, Math.floor(rawLimit)));
+    params.push(boundedLimit);
+
+    return this.db
+      .prepare(`SELECT * FROM revoked_jtis ${whereSql} ORDER BY seq ASC LIMIT ?`)
+      .all(...params) as unknown as RevokedJtiRecord[];
+  }
+
+  public pruneExpiredRevokedJtis(nowEpochSeconds: number = Math.floor(Date.now() / 1000)): number {
+    const result = this.db
+      .prepare('DELETE FROM revoked_jtis WHERE expires_at IS NOT NULL AND expires_at < ?')
+      .run(nowEpochSeconds);
+    return Number(result.changes);
   }
 
   public close(): void {
