@@ -24,3 +24,14 @@ export {
   type PkcePair,
   type BuildAuthorizationUrlOptions,
 } from './pkce.js';
+
+export {
+  createRidVerifier,
+  extractBearerToken,
+  type RidVerifierAlgorithm,
+  type RidVerifierConfig,
+  type RidHttpRequest,
+  type RidHttpResponse,
+  type RidNextFunction,
+  type RidVerifier,
+} from './verifier.js';
