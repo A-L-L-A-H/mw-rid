@@ -4,6 +4,11 @@ import type { ClientMetadata } from 'oidc-provider';
 import type { LoadSigningKeysOptions } from './crypto/keys.js';
 import { hashSecretSha256, verifyPassword } from './crypto/passwords.js';
 import { createOidcProvider } from './oidc/provider.js';
+import {
+  createEmailOtpService,
+  isValidEmailOtpPurpose,
+  type EmailOtpServiceOptions,
+} from './services/email-otp.js';
 import { IdentityDatabase } from './storage/sqlite.js';
 
 export interface RidServerOptions {
@@ -15,6 +20,8 @@ export interface RidServerOptions {
   defaultAudience?: string;
   clients?: ClientMetadata[];
   signingKeyOptions?: LoadSigningKeysOptions;
+  nodeEnv?: string;
+  otpOptions?: EmailOtpServiceOptions;
 }
 
 export interface RunningRidServer {
@@ -54,8 +61,13 @@ export async function startRidServer(options: RidServerOptions = {}): Promise<Ru
   const host = options.host ?? '127.0.0.1';
   const requestedPort = options.port ?? Number(process.env.MW_RID_PORT ?? 4480);
   const dbPath = options.dbPath ?? process.env.MW_RID_DB_PATH ?? ':memory:';
+  const nodeEnv = options.nodeEnv ?? options.otpOptions?.nodeEnv ?? process.env.NODE_ENV ?? 'development';
 
   const identityDb = new IdentityDatabase(dbPath);
+  const emailOtpService = createEmailOtpService({
+    nodeEnv,
+    ...options.otpOptions,
+  });
   const bootstrapSecret =
     options.bootstrapSecret ??
     process.env.MW_RID_BOOTSTRAP_SECRET ??
@@ -89,6 +101,128 @@ export async function startRidServer(options: RidServerOptions = {}): Promise<Ru
 
       if (method === 'GET' && pathname === '/health') {
         sendJson(response, 200, { status: 'ok', service: 'mw-rid', issuer });
+        return;
+      }
+
+      if (method === 'POST' && pathname === '/api/auth/otp/request') {
+        const body = await readJsonBody(request);
+        const email = typeof body.email === 'string' ? body.email.trim() : '';
+        const purposeRaw = body.purpose ?? 'login_otp';
+
+        if (!email || !isValidEmailOtpPurpose(purposeRaw)) {
+          sendJson(response, 400, {
+            error: 'invalid_request',
+            message: 'Valid email and purpose (login_otp | email_verify | password_reset) are required.',
+          });
+          return;
+        }
+
+        try {
+          const result = await emailOtpService.sendOtp({
+            email,
+            purpose: purposeRaw,
+          });
+          const responsePayload: Record<string, unknown> = {
+            sent: true,
+            delivery: result.delivery,
+            token: result.token,
+            expiresAt: result.expiresAt,
+          };
+          if (result.messageId !== undefined) {
+            responsePayload.messageId = result.messageId;
+          }
+          if (nodeEnv !== 'production' && result.previewCode !== undefined) {
+            responsePayload.previewCode = result.previewCode;
+          }
+          sendJson(response, 200, responsePayload);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'otp_request_failed';
+          sendJson(response, 400, { error: 'otp_request_failed', message });
+        }
+        return;
+      }
+
+      if (method === 'POST' && pathname === '/api/auth/otp/verify') {
+        const body = await readJsonBody(request);
+        const email = typeof body.email === 'string' ? body.email.trim() : '';
+        const code = typeof body.code === 'string' ? body.code.trim() : '';
+        const token = typeof body.token === 'string' ? body.token.trim() : '';
+        const purposeRaw = body.purpose ?? 'login_otp';
+
+        if (!email || !code || !token || !isValidEmailOtpPurpose(purposeRaw)) {
+          sendJson(response, 400, {
+            error: 'invalid_request',
+            message: 'email, code, token, and valid purpose are required.',
+          });
+          return;
+        }
+
+        const verification = emailOtpService.verifyOtp({
+          email,
+          code,
+          token,
+          purpose: purposeRaw,
+        });
+        if (!verification.valid) {
+          sendJson(response, 401, {
+            error: 'invalid_otp',
+            reason: verification.reason,
+          });
+          return;
+        }
+
+        sendJson(response, 200, {
+          verified: true,
+          email: verification.email,
+          purpose: verification.purpose,
+        });
+        return;
+      }
+
+      if (method === 'POST' && pathname === '/api/auth/password-reset/confirm') {
+        const body = await readJsonBody(request);
+        const email = typeof body.email === 'string' ? body.email.trim() : '';
+        const code = typeof body.code === 'string' ? body.code.trim() : '';
+        const token = typeof body.token === 'string' ? body.token.trim() : '';
+        const newPassword = typeof body.newPassword === 'string' ? body.newPassword : '';
+
+        if (!email || !code || !token || newPassword.length < 8) {
+          sendJson(response, 400, {
+            error: 'invalid_request',
+            message: 'email, code, token, and newPassword (min 8 chars) are required.',
+          });
+          return;
+        }
+
+        const verification = emailOtpService.verifyOtp({
+          email,
+          code,
+          token,
+          purpose: 'password_reset',
+        });
+        if (!verification.valid) {
+          sendJson(response, 401, {
+            error: 'invalid_otp',
+            reason: verification.reason,
+          });
+          return;
+        }
+
+        const account = identityDb.findAccountByEmail(verification.email);
+        if (!account || account.status !== 'active') {
+          sendJson(response, 404, {
+            error: 'account_not_found',
+            message: 'Active account for email not found.',
+          });
+          return;
+        }
+
+        identityDb.updateAccountPassword(account.sub, newPassword);
+        sendJson(response, 200, {
+          reset: true,
+          sub: account.sub,
+          email: verification.email,
+        });
         return;
       }
 

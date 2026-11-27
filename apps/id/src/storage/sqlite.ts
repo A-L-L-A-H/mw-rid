@@ -231,6 +231,25 @@ export class IdentityDatabase {
       .get(username) as AccountRecord | undefined;
   }
 
+  public findAccountByEmail(email: string): AccountRecord | undefined {
+    const normalized = email.trim().toLowerCase();
+    if (!normalized) {
+      return undefined;
+    }
+    return this.db
+      .prepare('SELECT * FROM accounts WHERE LOWER(email) = ? LIMIT 1')
+      .get(normalized) as AccountRecord | undefined;
+  }
+
+  public updateAccountPassword(sub: string, newPassword: string): boolean {
+    const now = new Date().toISOString();
+    const passwordHash = hashPassword(newPassword);
+    const result = this.db
+      .prepare('UPDATE accounts SET password_hash = ?, updated_at = ? WHERE sub = ?')
+      .run(passwordHash, now, sub);
+    return Number(result.changes) > 0;
+  }
+
   public registerServicePrincipal(input: {
     name: string;
     clientId: string;

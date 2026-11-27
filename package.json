@@ -13,7 +13,7 @@
   "scripts": {
     "build": "npm run build --workspace=@moonwitness/rid-sdk && npm run build --workspace=@moonwitness/rid-server",
     "typecheck": "npm run build",
-    "test": "npm run build && node --test tests/rid.test.mjs",
+    "test": "npm run build && node --test tests/*.test.mjs",
     "start": "node apps/id/dist/index.js"
   },
   "devDependencies": {
