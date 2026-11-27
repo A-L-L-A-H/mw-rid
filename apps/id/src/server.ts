@@ -9,6 +9,12 @@ import {
   isValidEmailOtpPurpose,
   type EmailOtpServiceOptions,
 } from './services/email-otp.js';
+import {
+  createGoogleOAuthService,
+  GoogleOAuthError,
+  type GoogleOAuthConfig,
+} from './services/google-oauth.js';
+import { createTenantApiKeyService } from './services/tenant-api-keys.js';
 import { IdentityDatabase } from './storage/sqlite.js';
 
 export interface RidServerOptions {
@@ -22,6 +28,7 @@ export interface RidServerOptions {
   signingKeyOptions?: LoadSigningKeysOptions;
   nodeEnv?: string;
   otpOptions?: EmailOtpServiceOptions;
+  googleOAuthOptions?: GoogleOAuthConfig;
 }
 
 export interface RunningRidServer {
@@ -68,6 +75,11 @@ export async function startRidServer(options: RidServerOptions = {}): Promise<Ru
     nodeEnv,
     ...options.otpOptions,
   });
+  const googleOAuthService = createGoogleOAuthService({
+    nodeEnv,
+    ...options.googleOAuthOptions,
+  });
+  const tenantApiKeyService = createTenantApiKeyService(identityDb);
   const bootstrapSecret =
     options.bootstrapSecret ??
     process.env.MW_RID_BOOTSTRAP_SECRET ??
@@ -223,6 +235,205 @@ export async function startRidServer(options: RidServerOptions = {}): Promise<Ru
           sub: account.sub,
           email: verification.email,
         });
+        return;
+      }
+
+      if (method === 'GET' && pathname === '/api/auth/google/start') {
+        if (!googleOAuthService.isConfigured()) {
+          sendJson(response, 503, {
+            error: 'google_oauth_not_configured',
+            message: 'Google OAuth is not configured.',
+          });
+          return;
+        }
+        const loginHint = requestUrl.searchParams.get('login_hint') ?? undefined;
+        const authResult = googleOAuthService.buildAuthorizationUrl({ loginHint });
+        sendJson(response, 200, {
+          url: authResult.url,
+          state: authResult.state,
+          expiresAt: authResult.expiresAt,
+        });
+        return;
+      }
+
+      if (method === 'GET' && pathname === '/api/auth/google/callback') {
+        if (!googleOAuthService.isConfigured()) {
+          sendJson(response, 503, {
+            error: 'google_oauth_not_configured',
+            message: 'Google OAuth is not configured.',
+          });
+          return;
+        }
+
+        const oauthError = requestUrl.searchParams.get('error');
+        if (oauthError) {
+          sendJson(response, 400, {
+            error: 'google_oauth_error',
+            message: oauthError,
+          });
+          return;
+        }
+
+        const code = requestUrl.searchParams.get('code')?.trim() ?? '';
+        const state = requestUrl.searchParams.get('state')?.trim() ?? '';
+        if (!code || !state) {
+          sendJson(response, 400, {
+            error: 'invalid_request',
+            message: 'code and state query parameters are required.',
+          });
+          return;
+        }
+
+        try {
+          const result = await googleOAuthService.authenticateCallback({
+            code,
+            state,
+            identityDb,
+          });
+          sendJson(response, 200, {
+            authenticated: true,
+            created: result.created,
+            linked: result.linked,
+            account: {
+              sub: result.account.sub,
+              username: result.account.username,
+              email: result.account.email,
+              role: result.account.role,
+              status: result.account.status,
+            },
+            profile: {
+              sub: result.profile.sub,
+              email: result.profile.email,
+              name: result.profile.name,
+              hd: result.profile.hd,
+            },
+          });
+        } catch (err) {
+          if (err instanceof GoogleOAuthError) {
+            sendJson(response, err.statusCode, {
+              error: err.code,
+              message: err.message,
+            });
+            return;
+          }
+          const message = err instanceof Error ? err.message : 'google_callback_failed';
+          sendJson(response, 500, { error: 'google_callback_failed', message });
+        }
+        return;
+      }
+
+      const tenantApiKeysMatch = pathname.match(/^\/api\/tenants\/([^/]+)\/api-keys$/);
+      if (tenantApiKeysMatch) {
+        const tenantId = decodeURIComponent(tenantApiKeysMatch[1]).trim();
+        if (!tenantId) {
+          sendJson(response, 400, { error: 'invalid_request', message: 'tenantId is required.' });
+          return;
+        }
+
+        if (method === 'POST') {
+          const body = await readJsonBody(request);
+          const name = typeof body.name === 'string' ? body.name.trim() : '';
+          const scopes = Array.isArray(body.scopes)
+            ? body.scopes.map((entry) => String(entry))
+            : undefined;
+          const expiresInDays =
+            typeof body.expiresInDays === 'number' ? body.expiresInDays : undefined;
+
+          if (!name) {
+            sendJson(response, 400, {
+              error: 'invalid_request',
+              message: 'name is required.',
+            });
+            return;
+          }
+
+          try {
+            const created = tenantApiKeyService.createKey({
+              tenantId,
+              name,
+              scopes,
+              expiresInDays,
+            });
+            sendJson(response, 201, {
+              key: created.key,
+              apiKey: created.apiKey,
+            });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : 'api_key_creation_failed';
+            sendJson(response, 400, { error: 'invalid_request', message });
+          }
+          return;
+        }
+
+        if (method === 'GET') {
+          const keys = tenantApiKeyService.listKeys(tenantId);
+          sendJson(response, 200, { tenantId, keys });
+          return;
+        }
+      }
+
+      if (method === 'POST' && pathname === '/api/api-keys/verify') {
+        const body = await readJsonBody(request);
+        const authHeader = request.headers.authorization;
+        const bearerKey =
+          typeof authHeader === 'string' && authHeader.toLowerCase().startsWith('bearer ')
+            ? authHeader.slice(7).trim()
+            : '';
+        const rawKey =
+          typeof body.apiKey === 'string'
+            ? body.apiKey.trim()
+            : typeof body.api_key === 'string'
+              ? body.api_key.trim()
+              : bearerKey;
+
+        if (!rawKey) {
+          sendJson(response, 400, {
+            error: 'invalid_request',
+            message: 'apiKey is required.',
+          });
+          return;
+        }
+
+        const verified = tenantApiKeyService.verifyKey(rawKey);
+        if (!verified.valid) {
+          sendJson(response, 401, {
+            valid: false,
+            error: 'invalid_api_key',
+            reason: verified.reason,
+          });
+          return;
+        }
+
+        sendJson(response, 200, {
+          valid: true,
+          id: verified.id,
+          tenantId: verified.tenantId,
+          name: verified.name,
+          keyPrefix: verified.keyPrefix,
+          scopes: verified.scopes,
+        });
+        return;
+      }
+
+      const apiKeyRevokeMatch = pathname.match(/^\/api\/api-keys\/([^/]+)\/revoke$/);
+      if (method === 'POST' && apiKeyRevokeMatch) {
+        const keyId = decodeURIComponent(apiKeyRevokeMatch[1]).trim();
+        const body = await readJsonBody(request);
+        const tenantId =
+          typeof body.tenantId === 'string' && body.tenantId.trim().length > 0
+            ? body.tenantId.trim()
+            : (requestUrl.searchParams.get('tenantId') ?? undefined);
+
+        const revoked = tenantApiKeyService.revokeKey(keyId, tenantId);
+        if (!revoked) {
+          sendJson(response, 404, {
+            error: 'not_found',
+            message: 'API key not found or already revoked.',
+          });
+          return;
+        }
+
+        sendJson(response, 200, { id: keyId, revoked: true });
         return;
       }
 

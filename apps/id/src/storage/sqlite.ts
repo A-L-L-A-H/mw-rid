@@ -1,10 +1,45 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { hashPassword, hashSecretSha256, verifySecretSha256 } from '../crypto/passwords.js';
 
 export type AccountStatus = 'active' | 'disabled';
 export type AccountRole = 'platform_owner' | 'member';
-export type OutboxEventType = 'account.created' | 'account.disabled' | 'grant.revoked';
+export type OutboxEventType =
+  | 'account.created'
+  | 'account.disabled'
+  | 'grant.revoked'
+  | 'api_key.created'
+  | 'api_key.revoked';
+
+export interface FederatedIdentityRecord {
+  provider: string;
+  provider_sub: string;
+  account_sub: string;
+  email: string;
+  created_at: string;
+}
+
+export interface UpsertGoogleAccountResult {
+  account: AccountRecord;
+  created: boolean;
+  linked: boolean;
+}
+
+export type TenantApiKeyStatus = 'active' | 'revoked';
+
+export interface TenantApiKeyRecord {
+  id: string;
+  tenant_id: string;
+  name: string;
+  key_prefix: string;
+  secret_hash: string;
+  scopes: string;
+  status: TenantApiKeyStatus;
+  expires_at: string | null;
+  last_used_at: string | null;
+  created_at: string;
+  revoked_at: string | null;
+}
 
 export interface AccountRecord {
   sub: string;
@@ -96,6 +131,32 @@ export class IdentityDatabase {
         created_at TEXT NOT NULL,
         acked_at TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS federated_identities (
+        provider TEXT NOT NULL,
+        provider_sub TEXT NOT NULL,
+        account_sub TEXT NOT NULL,
+        email TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (provider, provider_sub),
+        FOREIGN KEY (account_sub) REFERENCES accounts(sub) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_federated_identities_account_sub ON federated_identities(account_sub);
+
+      CREATE TABLE IF NOT EXISTS tenant_api_keys (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        key_prefix TEXT NOT NULL,
+        secret_hash TEXT NOT NULL UNIQUE,
+        scopes TEXT NOT NULL,
+        status TEXT NOT NULL,
+        expires_at TEXT,
+        last_used_at TEXT,
+        created_at TEXT NOT NULL,
+        revoked_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_tenant_api_keys_tenant ON tenant_api_keys(tenant_id);
     `);
   }
 
@@ -248,6 +309,236 @@ export class IdentityDatabase {
       .prepare('UPDATE accounts SET password_hash = ?, updated_at = ? WHERE sub = ?')
       .run(passwordHash, now, sub);
     return Number(result.changes) > 0;
+  }
+
+  public upsertGoogleAccount(input: {
+    googleSub: string;
+    email: string;
+    name?: string;
+  }): UpsertGoogleAccountResult {
+    const googleSub = input.googleSub.trim();
+    const email = input.email.trim().toLowerCase();
+    if (!googleSub || !email) {
+      throw new Error('googleSub and email are required.');
+    }
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const now = new Date().toISOString();
+      const existingFed = this.db
+        .prepare('SELECT * FROM federated_identities WHERE provider = ? AND provider_sub = ?')
+        .get('google', googleSub) as FederatedIdentityRecord | undefined;
+
+      if (existingFed) {
+        const account = this.findAccountBySub(existingFed.account_sub);
+        if (!account) {
+          throw new Error('FEDERATED_ACCOUNT_MISSING');
+        }
+        if (account.status !== 'active') {
+          throw new Error('ACCOUNT_DISABLED');
+        }
+        if (account.email !== email) {
+          this.db
+            .prepare('UPDATE accounts SET email = ?, updated_at = ? WHERE sub = ?')
+            .run(email, now, account.sub);
+          this.db
+            .prepare('UPDATE federated_identities SET email = ? WHERE provider = ? AND provider_sub = ?')
+            .run(email, 'google', googleSub);
+          account.email = email;
+          account.updated_at = now;
+        }
+        this.db.exec('COMMIT');
+        return { account, created: false, linked: false };
+      }
+
+      const existingByEmail = this.findAccountByEmail(email);
+      if (existingByEmail) {
+        if (existingByEmail.status !== 'active') {
+          throw new Error('ACCOUNT_DISABLED');
+        }
+        this.db
+          .prepare(
+            `INSERT INTO federated_identities (provider, provider_sub, account_sub, email, created_at)
+             VALUES ('google', ?, ?, ?, ?)`,
+          )
+          .run(googleSub, existingByEmail.sub, email, now);
+        this.db.exec('COMMIT');
+        return { account: existingByEmail, created: false, linked: true };
+      }
+
+      const rawBase = (email.split('@')[0] || input.name || 'user')
+        .toLowerCase()
+        .replace(/[^a-z0-9._-]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 24) || 'user';
+
+      let username = rawBase;
+      if (this.findAccountByUsername(username)) {
+        username = `${rawBase}_${randomBytes(4).toString('hex')}`;
+      }
+
+      const sub = `rid_${randomUUID()}`;
+      const passwordHash = hashPassword(randomBytes(32).toString('base64url'));
+
+      this.db
+        .prepare(
+          `INSERT INTO accounts (sub, username, email, password_hash, role, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'member', 'active', ?, ?)`,
+        )
+        .run(sub, username, email, passwordHash, now, now);
+
+      this.db
+        .prepare(
+          `INSERT INTO federated_identities (provider, provider_sub, account_sub, email, created_at)
+           VALUES ('google', ?, ?, ?, ?)`,
+        )
+        .run(googleSub, sub, email, now);
+
+      this.insertOutboxEvent('account.created', sub, {
+        sub,
+        username,
+        email,
+        role: 'member',
+        status: 'active',
+        provider: 'google',
+      });
+
+      this.db.exec('COMMIT');
+
+      return {
+        account: {
+          sub,
+          username,
+          email,
+          password_hash: passwordHash,
+          role: 'member',
+          status: 'active',
+          created_at: now,
+          updated_at: now,
+        },
+        created: true,
+        linked: true,
+      };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  public createTenantApiKey(input: {
+    id: string;
+    tenantId: string;
+    name: string;
+    keyPrefix: string;
+    secretHash: string;
+    scopes: string[];
+    expiresAt: string | null;
+    createdAt?: string;
+  }): TenantApiKeyRecord {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const now = input.createdAt ?? new Date().toISOString();
+      const scopesJson = JSON.stringify(input.scopes);
+
+      this.db
+        .prepare(
+          `INSERT INTO tenant_api_keys
+           (id, tenant_id, name, key_prefix, secret_hash, scopes, status, expires_at, last_used_at, created_at, revoked_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'active', ?, NULL, ?, NULL)`,
+        )
+        .run(
+          input.id,
+          input.tenantId,
+          input.name,
+          input.keyPrefix,
+          input.secretHash,
+          scopesJson,
+          input.expiresAt,
+          now,
+        );
+
+      this.insertOutboxEvent('api_key.created', input.id, {
+        id: input.id,
+        tenant_id: input.tenantId,
+        key_prefix: input.keyPrefix,
+        scopes: input.scopes,
+        expires_at: input.expiresAt,
+      });
+
+      this.db.exec('COMMIT');
+
+      return {
+        id: input.id,
+        tenant_id: input.tenantId,
+        name: input.name,
+        key_prefix: input.keyPrefix,
+        secret_hash: input.secretHash,
+        scopes: scopesJson,
+        status: 'active',
+        expires_at: input.expiresAt,
+        last_used_at: null,
+        created_at: now,
+        revoked_at: null,
+      };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  public findTenantApiKeyBySecretHash(secretHash: string): TenantApiKeyRecord | undefined {
+    return this.db
+      .prepare('SELECT * FROM tenant_api_keys WHERE secret_hash = ? LIMIT 1')
+      .get(secretHash) as TenantApiKeyRecord | undefined;
+  }
+
+  public findTenantApiKeyById(id: string): TenantApiKeyRecord | undefined {
+    return this.db
+      .prepare('SELECT * FROM tenant_api_keys WHERE id = ? LIMIT 1')
+      .get(id) as TenantApiKeyRecord | undefined;
+  }
+
+  public listTenantApiKeys(tenantId: string): TenantApiKeyRecord[] {
+    return this.db
+      .prepare('SELECT * FROM tenant_api_keys WHERE tenant_id = ? ORDER BY created_at DESC, id ASC')
+      .all(tenantId) as unknown as TenantApiKeyRecord[];
+  }
+
+  public touchTenantApiKeyLastUsed(id: string, usedAtIso: string): boolean {
+    const result = this.db
+      .prepare('UPDATE tenant_api_keys SET last_used_at = ? WHERE id = ?')
+      .run(usedAtIso, id);
+    return Number(result.changes) > 0;
+  }
+
+  public revokeTenantApiKey(id: string, tenantId?: string): boolean {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const now = new Date().toISOString();
+      const result = tenantId
+        ? this.db
+            .prepare(
+              `UPDATE tenant_api_keys SET status = 'revoked', revoked_at = ?
+               WHERE id = ? AND tenant_id = ? AND status = 'active'`,
+            )
+            .run(now, id, tenantId)
+        : this.db
+            .prepare(
+              `UPDATE tenant_api_keys SET status = 'revoked', revoked_at = ?
+               WHERE id = ? AND status = 'active'`,
+            )
+            .run(now, id);
+
+      const revoked = Number(result.changes) > 0;
+      if (revoked) {
+        this.insertOutboxEvent('api_key.revoked', id, { id, tenant_id: tenantId ?? null, revoked_at: now });
+      }
+      this.db.exec('COMMIT');
+      return revoked;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   public registerServicePrincipal(input: {
