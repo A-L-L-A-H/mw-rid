@@ -1,5 +1,9 @@
 import Provider, { type ClientMetadata, type Configuration } from 'oidc-provider';
-import { loadSigningKeys, type LoadSigningKeysOptions } from '../crypto/keys.js';
+import {
+  loadSigningKeys,
+  type LoadSigningKeysOptions,
+  type SigningKeySet,
+} from '../crypto/keys.js';
 import { createSqliteAdapterFactory } from '../storage/oidc-adapter.js';
 import type { IdentityDatabase } from '../storage/sqlite.js';
 
@@ -10,6 +14,7 @@ export interface CreateOidcProviderOptions {
   clients?: ClientMetadata[];
   cookieKeys?: string[];
   signingKeyOptions?: LoadSigningKeysOptions;
+  signingKeySet?: SigningKeySet;
 }
 
 export function getDefaultPublicClients(): ClientMetadata[] {
@@ -41,7 +46,7 @@ export function getDefaultPublicClients(): ClientMetadata[] {
 export async function createOidcProvider(options: CreateOidcProviderOptions): Promise<Provider> {
   const { issuer, identityDb } = options;
   const defaultAudience = options.defaultAudience ?? 'urn:moonwitness:api';
-  const jwks = await loadSigningKeys(options.signingKeyOptions);
+  const jwks = options.signingKeySet ?? (await loadSigningKeys(options.signingKeyOptions));
   const adapter = createSqliteAdapterFactory(identityDb);
 
   const configuration: Configuration = {

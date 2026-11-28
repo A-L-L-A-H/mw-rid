@@ -1,8 +1,22 @@
 export {
   verifyAccessToken,
+  clearJwksCache,
+  reloadJwks,
   type VerifyAccessTokenOptions,
   type VerifiedAccessToken,
 } from './verify.js';
+
+export {
+  checkJtiRevoked,
+  createRevocationSyncClient,
+  type RevokedJtiEntry,
+  type RevocationSyncResponse,
+  type CheckJtiRevokedOptions,
+  type CheckJtiRevokedResult,
+  type CreateRevocationSyncClientOptions,
+  type RevocationSyncSummary,
+  type RevocationSyncClient,
+} from './revocation.js';
 
 export {
   createPkcePair,
@@ -10,3 +24,14 @@ export {
   type PkcePair,
   type BuildAuthorizationUrlOptions,
 } from './pkce.js';
+
+export {
+  createRidVerifier,
+  extractBearerToken,
+  type RidVerifierAlgorithm,
+  type RidVerifierConfig,
+  type RidHttpRequest,
+  type RidHttpResponse,
+  type RidNextFunction,
+  type RidVerifier,
+} from './verifier.js';

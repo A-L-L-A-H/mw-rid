@@ -1,7 +1,13 @@
 import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { ClientMetadata } from 'oidc-provider';
-import type { LoadSigningKeysOptions } from './crypto/keys.js';
+import {
+  createSigningKeyManager,
+  type KeyRotationResult,
+  type LoadSigningKeysOptions,
+  type RotateSigningKeyOptions,
+  type SigningKeyManager,
+} from './crypto/keys.js';
 import { hashSecretSha256, verifyPassword } from './crypto/passwords.js';
 import { createOidcProvider } from './oidc/provider.js';
 import {
@@ -14,6 +20,10 @@ import {
   GoogleOAuthError,
   type GoogleOAuthConfig,
 } from './services/google-oauth.js';
+import {
+  createJtiRevocationService,
+  type JtiRevocationService,
+} from './services/jti-revocation.js';
 import { createTenantApiKeyService } from './services/tenant-api-keys.js';
 import { IdentityDatabase } from './storage/sqlite.js';
 
@@ -25,7 +35,9 @@ export interface RidServerOptions {
   bootstrapSecret?: string;
   defaultAudience?: string;
   clients?: ClientMetadata[];
+  cookieKeys?: string[];
   signingKeyOptions?: LoadSigningKeysOptions;
+  signingKeyManager?: SigningKeyManager;
   nodeEnv?: string;
   otpOptions?: EmailOtpServiceOptions;
   googleOAuthOptions?: GoogleOAuthConfig;
@@ -37,6 +49,10 @@ export interface RunningRidServer {
   port: number;
   identityDb: IdentityDatabase;
   bootstrapSecret: string;
+  keyManager: SigningKeyManager;
+  jtiRevocationService: JtiRevocationService;
+  rotateSigningKeys: (options?: RotateSigningKeyOptions) => Promise<KeyRotationResult>;
+  expireGraceSigningKey: () => Promise<boolean>;
   close: () => Promise<void>;
 }
 
@@ -80,6 +96,7 @@ export async function startRidServer(options: RidServerOptions = {}): Promise<Ru
     ...options.googleOAuthOptions,
   });
   const tenantApiKeyService = createTenantApiKeyService(identityDb);
+  const jtiRevocationService = createJtiRevocationService(identityDb);
   const bootstrapSecret =
     options.bootstrapSecret ??
     process.env.MW_RID_BOOTSTRAP_SECRET ??
@@ -95,15 +112,69 @@ export async function startRidServer(options: RidServerOptions = {}): Promise<Ru
   const baseUrl = `http://${host}:${actualPort}`;
   const issuer = options.issuer ?? process.env.MW_RID_ISSUER ?? baseUrl;
 
-  const provider = await createOidcProvider({
-    issuer,
-    identityDb,
-    defaultAudience: options.defaultAudience ?? process.env.MW_RID_DEFAULT_AUDIENCE,
-    clients: options.clients,
-    signingKeyOptions: options.signingKeyOptions,
-  });
+  const keyManager =
+    options.signingKeyManager ??
+    (await createSigningKeyManager({
+      nodeEnv,
+      ...options.signingKeyOptions,
+    }));
 
-  const oidcCallback = provider.callback();
+  const buildProvider = async () =>
+    createOidcProvider({
+      issuer,
+      identityDb,
+      defaultAudience: options.defaultAudience ?? process.env.MW_RID_DEFAULT_AUDIENCE,
+      clients: options.clients,
+      cookieKeys: options.cookieKeys,
+      signingKeyOptions: options.signingKeyOptions,
+      signingKeySet: keyManager.getOidcJwks(),
+    });
+
+  let provider = await buildProvider();
+  let oidcCallback = provider.callback();
+  let rotationChain = Promise.resolve();
+
+  const rebuildOidcProvider = async (): Promise<void> => {
+    const nextProvider = await buildProvider();
+    provider = nextProvider;
+    oidcCallback = nextProvider.callback();
+  };
+
+  const rotateSigningKeys = (
+    rotateOptions: RotateSigningKeyOptions = {},
+  ): Promise<KeyRotationResult> => {
+    const next = rotationChain.then(async () => {
+      const rotation = await keyManager.rotateKey(rotateOptions);
+      await rebuildOidcProvider();
+      identityDb.insertOutboxEvent('jwks.rotated', rotation.activeKid, {
+        active_kid: rotation.activeKid,
+        previous_kid: rotation.previousKid,
+        grace_expires_at: rotation.graceExpiresAt,
+        kids: rotation.kids,
+      });
+      return rotation;
+    });
+    rotationChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  };
+
+  const expireGraceSigningKey = (): Promise<boolean> => {
+    const next = rotationChain.then(async () => {
+      const expired = keyManager.expireGraceKey();
+      if (expired) {
+        await rebuildOidcProvider();
+      }
+      return expired;
+    });
+    rotationChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  };
 
   tempServer.on('request', async (request: IncomingMessage, response: ServerResponse) => {
     try {
@@ -113,6 +184,16 @@ export async function startRidServer(options: RidServerOptions = {}): Promise<Ru
 
       if (method === 'GET' && pathname === '/health') {
         sendJson(response, 200, { status: 'ok', service: 'mw-rid', issuer });
+        return;
+      }
+
+      if (method === 'GET' && pathname === '/jwks') {
+        const publicJwks = keyManager.getPublicJwks();
+        response.statusCode = 200;
+        response.setHeader('content-type', 'application/jwk-set+json; charset=utf-8');
+        response.setHeader('access-control-allow-origin', '*');
+        response.setHeader('cache-control', 'no-store');
+        response.end(JSON.stringify(publicJwks));
         return;
       }
 
@@ -569,6 +650,169 @@ export async function startRidServer(options: RidServerOptions = {}): Promise<Ru
         return;
       }
 
+      if (method === 'GET' && pathname === '/api/keys') {
+        const status = keyManager.getKeyStatus();
+        sendJson(response, 200, {
+          activeKid: status.activeKid,
+          previousKid: status.previousKid,
+          graceExpiresAt: status.graceExpiresAt,
+          kids: status.kids,
+        });
+        return;
+      }
+
+      if (method === 'POST' && pathname === '/api/keys/rotate') {
+        const body = await readJsonBody(request);
+        const graceWindowSeconds =
+          typeof body.graceWindowSeconds === 'number' ? body.graceWindowSeconds : undefined;
+        const signingKeyPem =
+          typeof body.signingKeyPem === 'string' && body.signingKeyPem.trim().length > 0
+            ? body.signingKeyPem
+            : undefined;
+
+        try {
+          const rotated = await rotateSigningKeys({
+            graceWindowSeconds,
+            signingKeyPem,
+          });
+          sendJson(response, 200, {
+            rotated: true,
+            activeKid: rotated.activeKid,
+            previousKid: rotated.previousKid,
+            graceExpiresAt: rotated.graceExpiresAt,
+            kids: rotated.kids,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'key_rotation_failed';
+          sendJson(response, 400, { error: 'invalid_request', message });
+        }
+        return;
+      }
+
+      if (method === 'POST' && pathname === '/api/keys/expire-grace') {
+        const expired = await expireGraceSigningKey();
+        const status = keyManager.getKeyStatus();
+        sendJson(response, 200, {
+          expired,
+          activeKid: status.activeKid,
+          previousKid: status.previousKid,
+          graceExpiresAt: status.graceExpiresAt,
+          kids: status.kids,
+        });
+        return;
+      }
+
+      if (pathname === '/api/revocations/check' && (method === 'GET' || method === 'POST')) {
+        const body = method === 'POST' ? await readJsonBody(request) : {};
+        const jti =
+          typeof body.jti === 'string'
+            ? body.jti.trim()
+            : (requestUrl.searchParams.get('jti')?.trim() ?? '');
+        const token =
+          typeof body.token === 'string'
+            ? body.token.trim()
+            : (requestUrl.searchParams.get('token')?.trim() ?? '');
+
+        if (!jti && !token) {
+          sendJson(response, 400, {
+            error: 'invalid_request',
+            message: 'jti or token is required.',
+          });
+          return;
+        }
+
+        try {
+          const result = jtiRevocationService.check({ jti, token });
+          sendJson(response, 200, {
+            revoked: result.revoked,
+            jti: result.jti,
+            revocation: result.revocation,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'revocation_check_failed';
+          sendJson(response, 400, { error: 'invalid_request', message });
+        }
+        return;
+      }
+
+      if (pathname === '/api/revocations') {
+        if (method === 'POST') {
+          const body = await readJsonBody(request);
+          const jti = typeof body.jti === 'string' ? body.jti.trim() : undefined;
+          const token = typeof body.token === 'string' ? body.token.trim() : undefined;
+          const kid = typeof body.kid === 'string' ? body.kid.trim() : undefined;
+          const sub = typeof body.sub === 'string' ? body.sub.trim() : undefined;
+          const reason = typeof body.reason === 'string' ? body.reason.trim() : undefined;
+          const expiresAt = typeof body.expiresAt === 'number' ? body.expiresAt : undefined;
+
+          try {
+            const result = jtiRevocationService.revoke({
+              jti,
+              token,
+              kid,
+              sub,
+              reason,
+              expiresAt,
+            });
+            sendJson(response, result.created ? 201 : 200, {
+              revoked: true,
+              created: result.created,
+              revocation: result.revocation,
+            });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : 'jti_revocation_failed';
+            sendJson(response, 400, { error: 'invalid_request', message });
+          }
+          return;
+        }
+
+        if (method === 'GET') {
+          const sinceParam = requestUrl.searchParams.get('since');
+          const since =
+            sinceParam !== null && sinceParam.trim().length > 0
+              ? Number(sinceParam)
+              : undefined;
+          if (since !== undefined && (!Number.isFinite(since) || since < 0)) {
+            sendJson(response, 400, {
+              error: 'invalid_request',
+              message: 'since must be a non-negative number.',
+            });
+            return;
+          }
+
+          const limitParam = requestUrl.searchParams.get('limit');
+          const limit =
+            limitParam !== null && limitParam.trim().length > 0
+              ? Number(limitParam)
+              : undefined;
+          if (limit !== undefined && (!Number.isFinite(limit) || limit <= 0)) {
+            sendJson(response, 400, {
+              error: 'invalid_request',
+              message: 'limit must be a positive number.',
+            });
+            return;
+          }
+
+          const sinceRevokedAt = requestUrl.searchParams.get('sinceRevokedAt') ?? undefined;
+          const includeExpired =
+            requestUrl.searchParams.get('includeExpired') === 'true' ||
+            requestUrl.searchParams.get('includeExpired') === '1';
+
+          const synced = jtiRevocationService.sync({
+            since,
+            sinceRevokedAt,
+            limit,
+            includeExpired,
+          });
+          sendJson(response, 200, {
+            revocations: synced.revocations,
+            cursor: synced.cursor,
+            syncedAt: synced.syncedAt,
+          });
+          return;
+        }
+      }
+
       const interactionLoginMatch = pathname.match(/^\/interaction\/([^/]+)\/login$/);
       if (method === 'POST' && interactionLoginMatch) {
         const details = await provider.interactionDetails(request, response);
@@ -637,6 +881,10 @@ export async function startRidServer(options: RidServerOptions = {}): Promise<Ru
     port: actualPort,
     identityDb,
     bootstrapSecret,
+    keyManager,
+    jtiRevocationService,
+    rotateSigningKeys,
+    expireGraceSigningKey,
     close: async () => {
       await new Promise<void>((resolve, reject) => {
         tempServer.close((closeError) => {

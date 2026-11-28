@@ -1,4 +1,10 @@
-import { createRemoteJWKSet, jwtVerify, type JWTPayload, type JWTHeaderParameters } from 'jose';
+import {
+  createRemoteJWKSet,
+  jwtVerify,
+  type JWTPayload,
+  type JWTHeaderParameters,
+} from 'jose';
+import { checkJtiRevoked, type RevocationSyncClient } from './revocation.js';
 
 const ALLOWED_ASYMMETRIC_ALGS = [
   'RS256',
@@ -18,6 +24,19 @@ export interface VerifyAccessTokenOptions {
   issuer: string;
   audience: string | string[];
   jwksUri: string;
+  jwksCooldownDurationMs?: number;
+  jwksCacheMaxAgeMs?: number;
+  forceJwksRefresh?: boolean;
+  requireJti?: boolean;
+  revokedJtis?: ReadonlySet<string>;
+  revocationSync?: Pick<RevocationSyncClient, 'isRevoked'>;
+  revocationCheckUri?: string;
+  revocationCheckHeaders?: Record<string, string>;
+  fetchImpl?: typeof fetch;
+  isJtiRevoked?: (
+    jti: string,
+    context: { header: JWTHeaderParameters; payload: JWTPayload },
+  ) => boolean | Promise<boolean>;
 }
 
 export interface VerifiedAccessToken {
@@ -26,19 +45,52 @@ export interface VerifiedAccessToken {
     sub?: string;
     scope?: string;
     client_id?: string;
+    jti?: string;
   };
 }
 
-const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+type RemoteJwksResolver = ReturnType<typeof createRemoteJWKSet>;
 
-function getRemoteJwks(jwksUri: string): ReturnType<typeof createRemoteJWKSet> {
-  const cached = jwksCache.get(jwksUri);
+const jwksCache = new Map<string, Map<string, RemoteJwksResolver>>();
+
+function getRemoteJwks(
+  jwksUri: string,
+  options?: { cooldownDurationMs?: number; cacheMaxAgeMs?: number },
+): RemoteJwksResolver {
+  let uriMap = jwksCache.get(jwksUri);
+  if (!uriMap) {
+    uriMap = new Map<string, RemoteJwksResolver>();
+    jwksCache.set(jwksUri, uriMap);
+  }
+
+  const variantKey = `${options?.cooldownDurationMs ?? 'default'}:${options?.cacheMaxAgeMs ?? 'default'}`;
+  const cached = uriMap.get(variantKey);
   if (cached) {
     return cached;
   }
-  const remoteJwks = createRemoteJWKSet(new URL(jwksUri));
-  jwksCache.set(jwksUri, remoteJwks);
+
+  const remoteJwks = createRemoteJWKSet(new URL(jwksUri), {
+    cooldownDuration: options?.cooldownDurationMs,
+    cacheMaxAge: options?.cacheMaxAgeMs,
+  });
+  uriMap.set(variantKey, remoteJwks);
   return remoteJwks;
+}
+
+export function clearJwksCache(jwksUri?: string): void {
+  if (!jwksUri) {
+    jwksCache.clear();
+    return;
+  }
+  jwksCache.delete(jwksUri);
+}
+
+export async function reloadJwks(jwksUri: string): Promise<void> {
+  const uriMap = jwksCache.get(jwksUri);
+  if (!uriMap) {
+    return;
+  }
+  await Promise.all(Array.from(uriMap.values()).map((remoteJwks) => remoteJwks.reload()));
 }
 
 export async function verifyAccessToken(
@@ -50,7 +102,14 @@ export async function verifyAccessToken(
     throw new Error('Access token must be a non-empty string');
   }
 
-  const jwks = getRemoteJwks(jwksUri);
+  const jwks = getRemoteJwks(jwksUri, {
+    cooldownDurationMs: options.jwksCooldownDurationMs,
+    cacheMaxAgeMs: options.jwksCacheMaxAgeMs,
+  });
+
+  if (options.forceJwksRefresh) {
+    await jwks.reload();
+  }
 
   const verification = await jwtVerify(token, jwks, {
     issuer,
@@ -78,6 +137,51 @@ export async function verifyAccessToken(
 
   if (typeof payload.exp !== 'number') {
     throw new Error('Access token must contain a numeric exp claim');
+  }
+
+  const needsRevocationCheck = Boolean(
+    options.requireJti ||
+      options.revokedJtis ||
+      options.revocationSync ||
+      options.revocationCheckUri ||
+      options.isJtiRevoked,
+  );
+
+  if (needsRevocationCheck) {
+    const jti = typeof payload.jti === 'string' ? payload.jti.trim() : '';
+    if (!jti) {
+      throw new Error('Access token must contain a non-empty jti claim');
+    }
+
+    if (options.revokedJtis?.has(jti)) {
+      throw new Error(`Access token jti is revoked: ${jti}`);
+    }
+
+    if (options.revocationSync?.isRevoked(jti)) {
+      throw new Error(`Access token jti is revoked: ${jti}`);
+    }
+
+    if (options.isJtiRevoked) {
+      const revoked = await options.isJtiRevoked(jti, {
+        header: protectedHeader,
+        payload,
+      });
+      if (revoked) {
+        throw new Error(`Access token jti is revoked: ${jti}`);
+      }
+    }
+
+    if (options.revocationCheckUri) {
+      const remoteCheck = await checkJtiRevoked({
+        jti,
+        revocationCheckUri: options.revocationCheckUri,
+        headers: options.revocationCheckHeaders,
+        fetchImpl: options.fetchImpl,
+      });
+      if (remoteCheck.revoked) {
+        throw new Error(`Access token jti is revoked: ${jti}`);
+      }
+    }
   }
 
   return {
